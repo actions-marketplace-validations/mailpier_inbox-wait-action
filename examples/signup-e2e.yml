@@ -1,0 +1,24 @@
+# Example workflow (not run in this repo). Copy it to .github/workflows/ in your project.
+name: e2e
+on: [push]
+jobs:
+  signup:
+    runs-on: ubuntu-latest
+    env:
+      SIGNUP_EMAIL: ci-${{ github.run_id }}@qa.acme.mailpier.io   # any address of your environment works
+    steps:
+      - uses: actions/checkout@v4
+      - name: Sign up on the test site (it sends the confirmation mail)
+        run: curl -fsS -X POST https://test.example.com/api/signup -d "email=$SIGNUP_EMAIL"
+      - uses: mailpier/inbox-wait-action@v0
+        id: mail
+        with:
+          api-key: ${{ secrets.MAILPIER_API_KEY }}
+          to: ${{ env.SIGNUP_EMAIL }}
+          subject-contains: Confirm
+          link-contains: verify
+          timeout: 180
+      - name: Confirm with the code
+        run: curl -fsS -X POST https://test.example.com/api/confirm -d "email=$SIGNUP_EMAIL&code=${{ steps.mail.outputs.code }}"
+      - name: Or open the link
+        run: curl -fsS "${{ steps.mail.outputs.first-link }}"

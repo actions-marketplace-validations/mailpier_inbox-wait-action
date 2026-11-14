@@ -1,0 +1,55 @@
+name: MailPier Inbox wait
+description: Wait for an email in a MailPier Inbox environment and output its one-time code, first link, id and subject.
+author: Solutions Group Unlimited
+branding:
+  icon: mail
+  color: blue
+inputs:
+  api-key:
+    description: MailPier Inbox API key (mpi_...). Keep it in a secret.
+    required: true
+  to:
+    description: The address the mail was sent to (e.g. signup-k3v9q2mz7a@qa.acme.mailpier.io).
+    required: false
+  address:
+    description: Alias of `to`.
+    required: false
+  subject-contains:
+    description: Only a mail whose subject contains this (case-insensitive).
+    required: false
+  link-contains:
+    description: first-link is the first link whose URL or text contains this (any link when empty).
+    required: false
+  since:
+    description: Only a mail received at or after this ISO 8601 time (e.g. the time the test started).
+    required: false
+  timeout:
+    description: Seconds to wait in total.
+    required: false
+    default: "120"
+  fail-on-timeout:
+    description: Fail the step when no mail arrives in time ("false" sets timed-out=true and continues).
+    required: false
+    default: "true"
+  base-url:
+    description: API root.
+    required: false
+    default: https://api.mailpier.io
+outputs:
+  code:
+    description: The first one-time code found in the mail (empty when none).
+  first-link:
+    description: The first link (matching link-contains when given; empty when none).
+  message-id:
+    description: The mail's id (for the API's /v1/messages/{id}, /raw and /attachments).
+  subject:
+    description: The mail's subject.
+  from:
+    description: The sender.
+  received-utc:
+    description: When MailPier received it (ISO 8601, UTC).
+  timed-out:
+    description: '"true" when no mail arrived and fail-on-timeout is "false".'
+runs:
+  using: node24
+  main: dist/index.js

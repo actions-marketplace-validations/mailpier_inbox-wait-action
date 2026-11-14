@@ -1,0 +1,19 @@
+{
+  "name": "mailpier-inbox-wait-action",
+  "version": "0.1.0",
+  "private": true,
+  "description": "GitHub Action: wait for an email in MailPier Inbox and output its code, link, id and subject.",
+  "license": "MIT",
+  "type": "module",
+  "scripts": {
+    "build": "tsup",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.6",
+    "tsup": "^9.0.0",
+    "typescript": "~5.9.3",
+    "vitest": "^5.1.0"
+  }
+}
