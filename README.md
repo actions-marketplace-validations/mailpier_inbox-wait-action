@@ -1,7 +1,7 @@
 # MailPier Inbox wait (GitHub Action)
 
 Waits for an email in a [MailPier Inbox](https://mailpier.io) environment and outputs its one-time code, first link, id and
-subject, so a later step can use them. Planned public name `mailpier/inbox-wait-action` (not published yet).
+subject, so a later step can use them. Docs: https://mailpier.io/docs#github
 
 ## Quick start
 
