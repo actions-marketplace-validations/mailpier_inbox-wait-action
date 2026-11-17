@@ -5,7 +5,7 @@ import { spawnSync } from "node:child_process";
 import { builtinModules } from "node:module";
 import { fileURLToPath } from "node:url";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
-import { escapeData, getInput, run } from "../src/main.js";
+import { escapeData, getInput, printable, run } from "../src/main.js";
 import { startFakeMailPier, type FakeMailPier } from "../../node/src/testing/index.js";
 
 let fake: FakeMailPier;
@@ -115,10 +115,84 @@ describe("inbox-wait action", () => {
     expect(outputs.code).toBe("");
   });
 
+  it("validates wait-for", async () => {
+    expect((await go({ "wait-for": "sms", to: "a@b" })).exitCode).toBe(1);
+    expect(lines.at(-1)).toMatch(/wait-for must be email or webhook/);
+  });
+
   it("helpers: getInput and escapeData behave like @actions/core", () => {
     expect(getInput({ "INPUT_SUBJECT-CONTAINS": "  x " }, "subject-contains")).toBe("x");
     expect(getInput({ INPUT_MY_INPUT: "y" }, "my input")).toBe("y");
     expect(escapeData("a%b\r\nc")).toBe("a%25b%0D%0Ac");
+  });
+});
+
+describe("wait-for: webhook", () => {
+  it("waits for a request under path and writes request-id, method, path, body and json", async () => {
+    setTimeout(() => {
+      void fetch(`${fake.webhookUrl}/order-77/paid?x=1`, {
+        method: "POST", headers: { "Content-Type": "application/json" }, body: '{"event":"order.paid","n":1}',
+      });
+    }, 200);
+    const r = await go({ "wait-for": "webhook", path: "order-77", method: "post", timeout: "10" });
+    expect(r.exitCode).toBe(0);
+    const outputs = readOutputs(outFile);
+    expect(outputs).toMatchObject({
+      method: "POST", path: "/order-77/paid", body: '{"event":"order.paid","n":1}', json: '{"event":"order.paid","n":1}', "timed-out": "false",
+    });
+    expect(Number(outputs["request-id"])).toBeGreaterThan(0);
+    expect(outputs.code).toBeUndefined();                                 // no mail outputs in webhook mode
+    const wait = fake.requests.find((q) => q.url.startsWith("/v1/hooks/requests/wait"))!.url;
+    expect(wait).toContain("path=%2Forder-77");
+    expect(wait).toContain("method=post");
+    expect(lines.some((l) => l.startsWith("Received POST /order-77/paid?x=1"))).toBe(true);
+  });
+
+  it("never prints a caught path's newline (it could start a :: workflow command)", async () => {
+    fake.catchWebhook({ path: "/order-88\n::add-mask::x\u001b[2J" });
+    const r = await go({ "wait-for": "webhook", path: "order-88", timeout: "5" });
+    expect(r.exitCode).toBe(0);
+    const received = lines.find((l) => l.startsWith("Received "))!;
+    expect(received.startsWith("Received POST /order-88\\x0A::add-mask::x\\x1B[2J (request ")).toBe(true);
+    // (The action's own "::add-mask::<key>" line is fine; the path's must never start a line.)
+    expect(lines.some((l) => /[\u0000-\u001f]/.test(l) || l.startsWith("::add-mask::x"))).toBe(false);
+    expect(printable("a\r\nb\u009b")).toBe("a\\x0D\\x0Ab\\x9B");
+  });
+
+  it("json is empty for a non-JSON body and body is empty for a binary one; since is passed", async () => {
+    fake.catchWebhook({ path: "/t", body: "plain text", contentType: "text/plain" });
+    let r = await go({ "wait-for": "webhook", path: "/t", since: "2020-01-01T00:00:00Z", timeout: "5" });
+    expect(r.outputs).toMatchObject({ body: "plain text", json: "" });
+    expect(fake.requests.at(-1)!.url).toContain("since=2020-01-01T00%3A00%3A00Z");
+    fake.catchWebhook({ path: "/b", body: new Uint8Array([0xff, 0x00]) });
+    r = await go({ "wait-for": "webhook", path: "/b", timeout: "5" });
+    expect(r.outputs).toMatchObject({ body: "", json: "" });
+    expect(lines.at(-1)).toMatch(/binary body \(2 bytes\)/);
+  });
+
+  it("needs a path", async () => {
+    expect((await go({ "wait-for": "webhook" })).exitCode).toBe(1);
+    expect(lines.at(-1)).toMatch(/path is required with wait-for: webhook/);
+  });
+
+  it("fails on timeout, or with fail-on-timeout false sets timed-out and empty outputs", async () => {
+    let r = await go({ "wait-for": "webhook", path: "/none", timeout: "1" });
+    expect(r.exitCode).toBe(1);
+    expect(lines.some((l) => l.startsWith("::error title=MailPier Inbox::No webhook request to /none"))).toBe(true);
+    r = await go({ "wait-for": "WEBHOOK", path: "/none", timeout: "1", "fail-on-timeout": "false" });
+    expect(r.exitCode).toBe(0);
+    expect(readOutputs(outFile)).toMatchObject({ "timed-out": "true", "request-id": "", body: "", json: "" });
+  });
+
+  it("reports 404 (webhooks off) with the server's text", async () => {
+    const off = await startFakeMailPier({ webhooks: false });
+    try {
+      const r = await run({ env: { ...env({ "wait-for": "webhook", path: "/x" }), "INPUT_BASE-URL": off.url }, log: (l) => lines.push(l) });
+      expect(r.exitCode).toBe(1);
+      expect(lines.find((l) => l.startsWith("::error"))).toMatch(/HTTP 404/);
+    } finally {
+      await off.close();
+    }
   });
 });
 
@@ -137,6 +211,15 @@ describe("dist/index.js (what the runner executes)", () => {
     expect(stdout).toContain("Received");
     expect(code).toBe(0);
     expect(readOutputs(outFile).code).toBe("97531");
+  });
+
+  it("runs wait-for: webhook as a separate process", async () => {
+    fake.catchWebhook({ path: "/dist-hook", body: { ok: true } });
+    const { spawn } = await import("node:child_process");
+    const child = spawn(process.execPath, [dist], { env: { ...process.env, ...env({ "wait-for": "webhook", path: "/dist-hook", timeout: "10" }) } });
+    const code = await new Promise<number>((resolve) => child.on("close", (c) => resolve(c ?? -1)));
+    expect(code).toBe(0);
+    expect(readOutputs(outFile).json).toBe('{"ok":true}');
   });
 
   it("is a single self-contained file (imports only Node built-ins)", () => {
