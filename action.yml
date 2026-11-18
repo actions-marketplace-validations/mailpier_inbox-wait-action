@@ -1,5 +1,5 @@
 name: MailPier Inbox wait
-description: Wait for an email in a MailPier Inbox environment and output its one-time code, first link, id and subject.
+description: Wait for an email or a webhook request in a MailPier Inbox environment and output its code, link, id, subject or body.
 author: Solutions Group Unlimited
 branding:
   icon: mail
@@ -8,8 +8,12 @@ inputs:
   api-key:
     description: MailPier Inbox API key (mpi_...). Keep it in a secret.
     required: true
+  wait-for:
+    description: What to wait for, "email" (a mail to `to`) or "webhook" (a request to the environment's webhook URL under `path`).
+    required: false
+    default: email
   to:
-    description: The address the mail was sent to (e.g. signup-k3v9q2mz7a@qa.acme.mailpier.io).
+    description: The address the mail was sent to (e.g. signup-k3v9q2mz7a@qa.acme.mailpier.io). Required with wait-for email.
     required: false
   address:
     description: Alias of `to`.
@@ -20,15 +24,21 @@ inputs:
   link-contains:
     description: first-link is the first link whose URL or text contains this (any link when empty).
     required: false
+  path:
+    description: With wait-for webhook, only a request whose path after the webhook URL's token starts with this (e.g. /order-123; / for any). Required with wait-for webhook.
+    required: false
+  method:
+    description: With wait-for webhook, only a request with this HTTP method (e.g. POST; any when empty).
+    required: false
   since:
-    description: Only a mail received at or after this ISO 8601 time (e.g. the time the test started).
+    description: Only a mail or request received at or after this ISO 8601 time (e.g. the time the test started).
     required: false
   timeout:
     description: Seconds to wait in total.
     required: false
     default: "120"
   fail-on-timeout:
-    description: Fail the step when no mail arrives in time ("false" sets timed-out=true and continues).
+    description: Fail the step when nothing arrives in time ("false" sets timed-out=true and continues).
     required: false
     default: "true"
   base-url:
@@ -47,9 +57,19 @@ outputs:
   from:
     description: The sender.
   received-utc:
-    description: When MailPier received it (ISO 8601, UTC).
+    description: When MailPier received the mail (ISO 8601, UTC).
+  request-id:
+    description: With wait-for webhook, the caught request's id (for the API's /v1/hooks/requests/{id}).
+  method:
+    description: With wait-for webhook, the request's HTTP method.
+  path:
+    description: With wait-for webhook, the request's path after the token.
+  body:
+    description: With wait-for webhook, the request body as text (empty for a binary body).
+  json:
+    description: With wait-for webhook, the request body as JSON text (empty when the body is not JSON).
   timed-out:
-    description: '"true" when no mail arrived and fail-on-timeout is "false".'
+    description: '"true" when nothing arrived and fail-on-timeout is "false".'
 runs:
   using: node24
   main: dist/index.js

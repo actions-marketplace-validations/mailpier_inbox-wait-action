@@ -24,6 +24,17 @@ var MailPierTimeoutError = class extends Error {
     this.timeoutMs = timeoutMs;
   }
 };
+var MailPierWebhookTimeoutError = class extends MailPierTimeoutError {
+  path;
+  method;
+  constructor(path, timeoutMs, method) {
+    super(path, timeoutMs);
+    this.message = `No ${method ? `${method.toUpperCase()} ` : ""}webhook request to ${path} arrived within ${Math.round(timeoutMs / 1e3)} seconds.`;
+    this.name = "MailPierWebhookTimeoutError";
+    this.path = path;
+    this.method = method;
+  }
+};
 
 // ../node/src/message.ts
 var InboxMessage = class {
@@ -86,10 +97,72 @@ function normaliseCodes(codes) {
   return out;
 }
 
+// ../node/src/webhook.ts
+var WebhookRequest = class {
+  id;
+  receivedUtc;
+  method = "";
+  path = "/";
+  query;
+  contentType;
+  size = 0;
+  environment;
+  status = 0;
+  url;
+  headers = [];
+  body;
+  bodyBase64;
+  json;
+  form;
+  sourceIp;
+  headersTruncated = false;
+  ruleId;
+  forwardStatus;
+  constructor(data) {
+    Object.assign(this, data);
+    this.headers = Array.isArray(data.headers) ? data.headers.filter((h) => h && typeof h.name === "string").map((h) => ({ name: h.name, value: String(h.value ?? "") })) : [];
+    this.headersTruncated = data.headersTruncated === true;
+  }
+  /** The first value of a header (name case-insensitive), or undefined when the request has none. */
+  header(name) {
+    const n = name.toLowerCase();
+    return this.headers.find((h) => h.name.toLowerCase() === n)?.value;
+  }
+  /** The body bytes (from `body` or `bodyBase64`); empty when the request had no body. */
+  bytes() {
+    if (typeof this.bodyBase64 === "string" && this.bodyBase64) {
+      const bin = atob(this.bodyBase64);
+      const out = new Uint8Array(bin.length);
+      for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+      return out;
+    }
+    return new TextEncoder().encode(this.body ?? "");
+  }
+  /**
+   * The body as JSON: the server's parsed `json`, or the text body parsed here (a JSON body sent with another content type).
+   * Throws when the body is not JSON.
+   */
+  jsonBody() {
+    if (this.json !== void 0 && this.json !== null) return this.json;
+    if (typeof this.body === "string" && this.body.trim()) {
+      try {
+        return JSON.parse(this.body);
+      } catch {
+      }
+    }
+    throw new Error(`The body of ${this.method} ${this.path} (request ${this.id}, ${this.contentType ?? "no content type"}) is not JSON.`);
+  }
+  /** The plain JSON (what the API returned), e.g. to pass through a Cypress task. */
+  toJSON() {
+    const { ...plain } = this;
+    return plain;
+  }
+};
+
 // ../node/src/client.ts
 var DEFAULT_BASE_URL = "https://api.mailpier.io";
 var MAX_POLL_SECONDS = 120;
-var VERSION = "0.1.0";
+var VERSION = "0.1.1";
 var sleep = (ms, signal) => new Promise((resolve, reject) => {
   if (signal?.aborted) return reject(signal.reason);
   const t = setTimeout(() => {
@@ -110,6 +183,11 @@ function env(name) {
   const p = globalThis.process;
   const v = p?.env?.[name];
   return v && v.trim() ? v.trim() : void 0;
+}
+function webhookPath(path) {
+  const p = path?.trim();
+  if (!p) return void 0;
+  return p.startsWith("/") ? p : `/${p}`;
 }
 var MailPierInbox = class {
   baseUrl;
@@ -219,6 +297,129 @@ var MailPierInbox = class {
     const resp = await this.request("GET", "/v1/me", {});
     return await resp.json();
   }
+  // ------------------------------------------------------------------ Webhook inspector (/v1/hooks; 404 while the feature is off)
+  /** The environment's catch URL (made on first use), its switches and the plan's webhook limits. */
+  async getWebhookEndpoint() {
+    const resp = await this.request("GET", "/v1/hooks", {});
+    const json = await resp.json();
+    if (!json?.url) throw new MailPierInboxError(resp.status, "The server returned no webhook URL.");
+    return json;
+  }
+  /**
+   * The catch URL with a fresh random path, e.g. `{ url: "https://hook.gather-io.com/<token>/t-8f2k1x", path: "/t-8f2k1x" }`.
+   * Give `url` to the app under test and wait with `waitForWebhook({ path })`. Nothing is stored: any path works without this call.
+   */
+  async createWebhookUrl() {
+    const resp = await this.request("POST", "/v1/hooks/urls", {});
+    const json = await resp.json();
+    if (!json?.url || !json.path) throw new MailPierInboxError(resp.status, "The server returned no webhook URL.");
+    return { url: json.url, path: json.path };
+  }
+  /**
+   * Waits until a request to the catch URL arrives and returns it: the OLDEST match newer than `afterId` / `since`.
+   * Throws MailPierWebhookTimeoutError (a MailPierTimeoutError) when nothing arrives within `timeoutSeconds`.
+   */
+  async waitForWebhook(options = {}) {
+    const path = webhookPath(options.path);
+    const method = options.method?.trim() || void 0;
+    const timeoutSeconds = options.timeoutSeconds ?? 60;
+    if (!(timeoutSeconds > 0)) throw new Error("timeoutSeconds must be greater than 0.");
+    const timeoutMs = timeoutSeconds * 1e3;
+    const deadline = Date.now() + timeoutMs;
+    const since = iso(options.since);
+    for (; ; ) {
+      const left = deadline - Date.now();
+      const seconds = Math.min(Math.max(Math.ceil(left / 1e3), 1), MAX_POLL_SECONDS);
+      const resp = await this.request("GET", "/v1/hooks/requests/wait", {
+        path,
+        method,
+        afterId: options.afterId,
+        since,
+        timeoutSeconds: seconds
+      }, { signal: options.signal, timeoutMs: (seconds + 30) * 1e3 });
+      if (resp.status !== 204) return new WebhookRequest(await resp.json());
+      if (Date.now() >= deadline) throw new MailPierWebhookTimeoutError(path ?? "/", timeoutMs, method);
+    }
+  }
+  /** Caught requests of the environment, newest first (at most 100 per call). */
+  async listWebhooks(options = {}) {
+    const resp = await this.request("GET", "/v1/hooks/requests", {
+      path: webhookPath(options.path),
+      method: options.method?.trim() || void 0,
+      afterId: options.afterId,
+      since: iso(options.since),
+      take: options.take ?? 50,
+      skip: options.skip ?? 0
+    }, { signal: options.signal });
+    const json = await resp.json();
+    return json?.items ?? [];
+  }
+  /** One caught request with headers and body; null when it does not exist (or expired). */
+  async getWebhook(id) {
+    const resp = await this.request("GET", `/v1/hooks/requests/${encodeURIComponent(String(id))}`, {}, { allow404: true });
+    if (resp.status === 404) return null;
+    return new WebhookRequest(await resp.json());
+  }
+  /** The raw body bytes of a caught request; null when it does not exist. */
+  getWebhookBody(id) {
+    return this.download(`/v1/hooks/requests/${encodeURIComponent(String(id))}/body`);
+  }
+  /** Deletes one caught request. False when it did not exist. */
+  async deleteWebhook(id) {
+    const resp = await this.request("DELETE", `/v1/hooks/requests/${encodeURIComponent(String(id))}`, {}, { allow404: true });
+    return resp.status !== 404;
+  }
+  /** Deletes the caught requests whose path starts with `path` (every request of the environment when omitted); returns how many. */
+  async deleteWebhooks(options = {}) {
+    const resp = await this.request("DELETE", "/v1/hooks/requests", { path: webhookPath(options.path) });
+    const json = await resp.json();
+    return json?.deleted ?? 0;
+  }
+  /**
+   * Sends a caught request again (method, path, query, headers, body) to `url`, a PUBLIC http(s) address (MailPier never calls
+   * private or loopback addresses: 400). Not retried on 502/504 or network errors, so the target never gets it twice.
+   */
+  async replayWebhook(id, url) {
+    if (!url?.trim()) throw new Error("replayWebhook needs the URL to send the request to.");
+    const resp = await this.request(
+      "POST",
+      `/v1/hooks/requests/${encodeURIComponent(String(id))}/replay`,
+      {},
+      { body: JSON.stringify({ url: url.trim() }), once: true }
+    );
+    const json = await resp.json();
+    return { status: json?.status ?? null, durationMs: json?.durationMs ?? null, error: json?.error ?? null };
+  }
+  /**
+   * Adds a custom response: requests whose path starts with `rule.path` (and of `rule.method`, when given) get this status,
+   * content type, body and delay instead of 200 OK. Throws MailPierInboxError (400) when it is invalid or over the plan's count.
+   */
+  async addWebhookResponse(rule) {
+    const path = webhookPath(rule?.path);
+    if (!path) throw new Error('addWebhookResponse needs a path (e.g. "/stripe"; "/" for every request).');
+    const isObject = rule.body !== void 0 && rule.body !== null && typeof rule.body === "object";
+    const payload = {
+      method: rule.method?.trim() ? rule.method.trim().toUpperCase() : null,
+      path,
+      status: rule.status ?? 200,
+      contentType: rule.contentType ?? (isObject ? "application/json" : "text/plain"),
+      body: isObject ? JSON.stringify(rule.body) : rule.body ?? "",
+      delayMs: rule.delayMs ?? 0
+    };
+    const resp = await this.request("POST", "/v1/hooks/responses", {}, { body: JSON.stringify(payload), once: true });
+    return await resp.json();
+  }
+  /** The environment's custom responses. */
+  async listWebhookResponses() {
+    const resp = await this.request("GET", "/v1/hooks/responses", {});
+    const json = await resp.json();
+    return json?.items ?? [];
+  }
+  /** Deletes a custom response. False when it did not exist. */
+  async deleteWebhookResponse(id) {
+    const resp = await this.request("DELETE", `/v1/hooks/responses/${encodeURIComponent(String(id))}`, {}, { allow404: true });
+    return resp.status !== 404;
+  }
   // ------------------------------------------------------------------ plumbing
   async download(path) {
     const resp = await this.request("GET", path, {}, { allow404: true, accept: "*/*" });
@@ -234,6 +435,8 @@ var MailPierInbox = class {
   /**
    * One call with retries: 429 waits Retry-After (default 1 s), 502/503/504 and network errors back off 0.5, 1, 2, 4 ... s
    * (both capped at maxRetryDelayMs). Other errors throw MailPierInboxError with the server's {"error": "..."} text.
+   * `once`: a call that must not run twice (replay, add a rule) is retried only on 429 and 503 (refused before any work), never
+   * on 502/504 or network errors (it may have been done).
    */
   async request(method, path, query, o = {}) {
     const url = this.url(path, query);
@@ -259,7 +462,7 @@ var MailPierInbox = class {
         clearTimeout(timer);
         o.signal?.removeEventListener("abort", onAbort);
         if (o.signal?.aborted) throw err;
-        if (attempt >= this.maxRetries) {
+        if (attempt >= this.maxRetries || o.once) {
           throw new MailPierInboxError(0, `Could not reach MailPier Inbox at ${this.baseUrl}: ${err instanceof Error ? err.message : String(err)}`);
         }
         await sleep(this.backoff(attempt), o.signal);
@@ -277,7 +480,8 @@ var MailPierInbox = class {
         }
         throw new MailPierInboxError(429, message ?? "Too many requests.", retryAfter);
       }
-      if ((resp.status === 502 || resp.status === 503 || resp.status === 504) && attempt < this.maxRetries) {
+      const retryable = resp.status === 503 || !o.once && (resp.status === 502 || resp.status === 504);
+      if (retryable && attempt < this.maxRetries) {
         await sleep(this.backoff(attempt), o.signal);
         continue;
       }
@@ -317,6 +521,9 @@ function getInput(env2, name) {
 function escapeData(s) {
   return s.replace(/%/g, "%25").replace(/\r/g, "%0D").replace(/\n/g, "%0A");
 }
+function printable(text) {
+  return text.replace(/[\u0000-\u001f\u007f-\u009f]/g, (c) => `\\x${c.charCodeAt(0).toString(16).toUpperCase().padStart(2, "0")}`);
+}
 function writeOutputs(env2, outputs, log) {
   const file = env2.GITHUB_OUTPUT;
   if (!file) {
@@ -333,6 +540,7 @@ ${delim}
   }
   appendFileSync(file, text, "utf8");
 }
+var WEBHOOK_OUTPUTS = ["request-id", "method", "path", "body", "json"];
 async function run(deps) {
   const { env: env2, log } = deps;
   const fail = (message) => {
@@ -340,6 +548,7 @@ async function run(deps) {
     return { exitCode: 1, outputs: {} };
   };
   const apiKey = getInput(env2, "api-key");
+  const waitFor = (getInput(env2, "wait-for") || "email").toLowerCase();
   const to = getInput(env2, "to") || getInput(env2, "address");
   const subjectContains = getInput(env2, "subject-contains") || void 0;
   const linkContains = getInput(env2, "link-contains") || void 0;
@@ -349,11 +558,15 @@ async function run(deps) {
   const failOnTimeout = (getInput(env2, "fail-on-timeout") || "true").toLowerCase() !== "false";
   if (!apiKey) return fail("Input api-key is required (use a secret: api-key: ${{ secrets.MAILPIER_API_KEY }}).");
   log(`::add-mask::${apiKey}`);
-  if (!to) return fail("Input to (the address the mail was sent to) is required.");
+  if (waitFor !== "email" && waitFor !== "webhook") return fail(`Input wait-for must be email or webhook (got "${waitFor}").`);
+  if (waitFor === "email" && !to) return fail("Input to (the address the mail was sent to) is required.");
   const timeoutSeconds = Number(timeoutText);
   if (!Number.isFinite(timeoutSeconds) || timeoutSeconds <= 0) return fail(`Input timeout must be a number of seconds > 0 (got "${timeoutText}").`);
   if (since && Number.isNaN(Date.parse(since))) return fail(`Input since must be an ISO 8601 date/time (got "${since}").`);
   const inbox = new MailPierInbox({ apiKey, baseUrl, ...deps.clientOptions });
+  if (waitFor === "webhook") {
+    return waitForWebhook(deps, inbox, { path: getInput(env2, "path"), method: getInput(env2, "method") || void 0, since, timeoutSeconds, failOnTimeout }, fail);
+  }
   log(`Waiting up to ${timeoutSeconds} s for a mail to ${to}${subjectContains ? ` with "${subjectContains}" in the subject` : ""}...`);
   try {
     const m = await inbox.waitForMessage({ to, subjectContains, since, timeoutMs: timeoutSeconds * 1e3 });
@@ -374,6 +587,43 @@ async function run(deps) {
     if (err instanceof MailPierTimeoutError) {
       if (failOnTimeout) return fail(err.message);
       const outputs = { "timed-out": "true", "message-id": "", subject: "", from: "", "received-utc": "", code: "", "first-link": "" };
+      writeOutputs(env2, outputs, log);
+      log(`::warning title=MailPier Inbox::${escapeData(err.message)}`);
+      return { exitCode: 0, outputs };
+    }
+    if (err instanceof MailPierInboxError) return fail(err.message);
+    return fail(`Unexpected error: ${err instanceof Error ? err.message : String(err)}`);
+  }
+}
+async function waitForWebhook(deps, inbox, o, fail) {
+  const { env: env2, log } = deps;
+  if (!o.path) return fail("Input path is required with wait-for: webhook (the path after the webhook URL's token, e.g. /order-${{ github.run_id }}; / for any).");
+  const path = o.path.startsWith("/") ? o.path : `/${o.path}`;
+  log(`Waiting up to ${o.timeoutSeconds} s for a ${o.method ? `${o.method.toUpperCase()} ` : ""}webhook request to ${path}...`);
+  try {
+    const r = await inbox.waitForWebhook({ path, method: o.method, since: o.since, timeoutSeconds: o.timeoutSeconds });
+    let json = "";
+    try {
+      json = JSON.stringify(r.jsonBody()) ?? "";
+    } catch {
+    }
+    const outputs = {
+      "request-id": String(r.id),
+      method: r.method,
+      path: r.path,
+      body: r.body ?? "",
+      json,
+      "timed-out": "false"
+    };
+    writeOutputs(env2, outputs, log);
+    const binary = r.body === null || r.body === void 0 ? r.size > 0 ? `; binary body (${r.size} bytes), not in the body output` : "" : "";
+    log(`Received ${printable(`${r.method} ${r.path}${r.query ? `?${r.query}` : ""}`)} (request ${r.id}, ${r.size} bytes${json ? ", JSON" : ""}${binary}).`);
+    return { exitCode: 0, outputs };
+  } catch (err) {
+    if (err instanceof MailPierTimeoutError) {
+      if (o.failOnTimeout) return fail(err.message);
+      const outputs = { "timed-out": "true" };
+      for (const k of WEBHOOK_OUTPUTS) outputs[k] = "";
       writeOutputs(env2, outputs, log);
       log(`::warning title=MailPier Inbox::${escapeData(err.message)}`);
       return { exitCode: 0, outputs };

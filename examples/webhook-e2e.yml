@@ -1,0 +1,25 @@
+# Example workflow (not run in this repo). Copy it to .github/workflows/ in your project.
+# MAILPIER_WEBHOOK_URL (a repository variable) is your environment's webhook URL from its Webhooks tab.
+name: webhook-e2e
+on: [push]
+jobs:
+  order-webhook:
+    runs-on: ubuntu-latest
+    env:
+      HOOK_URL: ${{ vars.MAILPIER_WEBHOOK_URL }}/order-${{ github.run_id }}   # your environment's webhook URL + a unique path
+    steps:
+      - uses: actions/checkout@v4
+      - name: Pay an order on the test site (it sends the order.paid webhook to HOOK_URL)
+        run: curl -fsS -X POST https://test.example.com/api/orders/42/pay -d "webhookUrl=$HOOK_URL"
+      - uses: mailpier/inbox-wait-action@v0
+        id: hook
+        with:
+          api-key: ${{ secrets.MAILPIER_API_KEY }}
+          wait-for: webhook
+          path: /order-${{ github.run_id }}
+          method: POST
+          timeout: 60
+      - name: Check the event
+        env:
+          HOOK_JSON: ${{ steps.hook.outputs.json }}   # through env, never pasted into the script: anyone can post to a catch URL
+        run: test "$(jq -r .event <<< "$HOOK_JSON")" = "order.paid"

@@ -1,6 +1,6 @@
 {
   "name": "mailpier-inbox-wait-action",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "private": true,
   "description": "GitHub Action: wait for an email in MailPier Inbox and output its code, link, id and subject.",
   "license": "MIT",
